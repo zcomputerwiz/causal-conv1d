@@ -65,8 +65,9 @@ def get_platform():
 
 
 def get_cuda_bare_metal_version(cuda_dir):
+    nvcc_bin = os.path.join(cuda_dir, "bin", "nvcc") if cuda_dir else "nvcc"
     raw_output = subprocess.check_output(
-        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+        [nvcc_bin, "-V"], universal_newlines=True
     )
     output = raw_output.split()
     release_idx = output.index("release") + 1
@@ -126,8 +127,11 @@ def check_if_cuda_home_none(global_option: str) -> None:
     )
 
 
+NVCC_THREADS = os.getenv("NVCC_THREADS", "4")
+
+
 def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+    return nvcc_extra_args + ["--threads", NVCC_THREADS]
 
 
 cmdclass = {}
@@ -168,6 +172,7 @@ if not SKIP_CUDA_BUILD:
         check_if_cuda_home_none(PACKAGE_NAME)
         # Check, if CUDA11 is installed for compute capability 8.0
 
+        bare_metal_version = None
         if CUDA_HOME is not None:
             _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
             if bare_metal_version < Version("11.6"):
@@ -176,27 +181,33 @@ if not SKIP_CUDA_BUILD:
                     "Note: make sure nvcc has a supported version by running nvcc -V."
                 )
 
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_75,code=sm_75")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_87,code=sm_87")
-        if bare_metal_version >= Version("11.8"):
+        raw_archs = os.getenv("CAUSAL_CONV1D_CUDA_ARCHS")
+        if raw_archs:
+            arch_list = [a.strip() for a in re.split(r"[,;]+", raw_archs) if a.strip()]
+            for arch in arch_list:
+                cc_flag.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+        else:
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
-        if bare_metal_version >= Version("12.8"):
+            cc_flag.append("arch=compute_75,code=sm_75")
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100,code=sm_100")
+            cc_flag.append("arch=compute_80,code=sm_80")
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
-        if bare_metal_version >= Version("13.0"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_103,code=sm_103")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_110,code=sm_110")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_121,code=sm_121")
+            cc_flag.append("arch=compute_87,code=sm_87")
+            if bare_metal_version and bare_metal_version >= Version("11.8"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_90,code=sm_90")
+            if bare_metal_version and bare_metal_version >= Version("12.8"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_100,code=sm_100")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_120,code=sm_120")
+            if bare_metal_version and bare_metal_version >= Version("13.0"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_103,code=sm_103")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_110,code=sm_110")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_121,code=sm_121")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -204,12 +215,14 @@ if not SKIP_CUDA_BUILD:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+    cxx_std = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 11) else "c++17"
+
     if HIP_BUILD:
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"],
+            "cxx": ["-O3", f"-std={cxx_std}"],
             "nvcc": [
                 "-O3",
-                "-std=c++17",
+                f"-std={cxx_std}",
                 f"--offload-arch={os.getenv('HIP_ARCHITECTURES', 'native')}",
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -217,12 +230,44 @@ if not SKIP_CUDA_BUILD:
             ]
             + cc_flag,
         }
+    elif sys.platform == "win32":
+        msvc_flags = ["/Zc:preprocessor", "/Zc:__cplusplus", "/permissive-"]
+        nvcc_flags = [
+            "-O3",
+            f"-std={cxx_std}",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            "--ptxas-options=-v",
+            "-lineinfo",
+        ]
+        for flag in msvc_flags:
+            nvcc_flags.extend(["-Xcompiler", flag])
+        nvcc_flags.append("-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING")
+        nvcc_flags.extend(cc_flag)
+
+        extra_compile_args = {
+            "cxx": [
+                "/O2",
+                f"/std:{cxx_std}",
+                *msvc_flags,
+                "/DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING",
+            ],
+            "nvcc": append_nvcc_threads(nvcc_flags),
+        }
     else:
         extra_compile_args = {
-            "cxx": ["-O3"],
+            "cxx": ["-O3", f"-std={cxx_std}"],
             "nvcc": append_nvcc_threads(
                 [
                     "-O3",
+                    f"-std={cxx_std}",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_BFLOAT16_OPERATORS__",
